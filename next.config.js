@@ -1,6 +1,6 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
-  // Increase upload limits for Render.com
+  // Increase upload limits for Railway
   experimental: {
     serverComponentsExternalPackages: ["@aws-sdk/client-s3"],
   },
@@ -18,14 +18,6 @@ const nextConfig = {
 
   // Performance optimizations
   swcMinify: true,
-
-  // API route configuration
-  api: {
-    bodyParser: {
-      sizeLimit: "5gb",
-    },
-    responseLimit: false,
-  },
 
   // Headers for better caching
   async headers() {

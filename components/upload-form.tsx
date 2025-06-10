@@ -67,7 +67,7 @@ import { FilePreviewDialog } from "./file-preview-dialog"
 const MAX_FILE_SIZE = 1099511627776
 
 // Add these constants at the top of the component
-const CHUNK_SIZE = 1 * 1024 * 1024 // 1MB chunks
+const CHUNK_SIZE = 1 * 1024 * 1024 // 1MB chunks (same as your Express version)
 
 export function UploadForm() {
   const { t } = useTranslation()
@@ -163,6 +163,8 @@ export function UploadForm() {
       } catch (error) {
         setUser(null)
         setIsLoggedIn(false)
+      } finally {
+        setCheckingAuth(false)
       }
     }
 
@@ -331,7 +333,7 @@ export function UploadForm() {
     })
   }
 
-  // Replace the handleSubmit function with your multipart upload logic
+  // Replace the handleSubmit function with size-based upload logic
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
 
@@ -352,12 +354,6 @@ export function UploadForm() {
     setFailedFiles([])
 
     try {
-      const recipientEmailsArray = emailTo
-        .split(",")
-        .map((email) => email.trim())
-        .filter((email) => email.length > 0)
-
-      // Process each file using your multipart approach
       const uploadResults = []
 
       for (let fileIndex = 0; fileIndex < files.length; fileIndex++) {
@@ -366,7 +362,18 @@ export function UploadForm() {
         setUploadStatus(`Uploading ${file.name} (${formatFileSize(file.size)})...`)
 
         try {
-          const result = await uploadFileMultipart(file, fileIndex, files.length)
+          // Use chunked upload for files > 100MB, normal upload for smaller files
+          const fileSizeInMB = file.size / (1024 * 1024)
+
+          let result
+          if (fileSizeInMB > 100) {
+            console.log(`Using chunked upload for ${file.name} (${fileSizeInMB.toFixed(2)}MB)`)
+            result = await uploadFileMultipart(file, fileIndex, files.length)
+          } else {
+            console.log(`Using normal upload for ${file.name} (${fileSizeInMB.toFixed(2)}MB)`)
+            result = await uploadFileNormal(file, fileIndex, files.length)
+          }
+
           uploadResults.push(result)
           setUploadedFiles((prev) => [...prev, file.name])
         } catch (error) {
@@ -379,7 +386,6 @@ export function UploadForm() {
         throw new Error("All files failed to upload")
       }
 
-      // Create transfer record for the first successful upload (or handle multiple files)
       const firstResult = uploadResults[0]
       if (firstResult) {
         setShareLink(firstResult.shareLink)
@@ -409,7 +415,41 @@ export function UploadForm() {
     }
   }
 
-  // Add your exact multipart upload function
+  // Add this new function for normal uploads (small files)
+  const uploadFileNormal = async (file: File, fileIndex: number, totalFiles: number) => {
+    const formData = new FormData()
+    formData.append("files", file)
+
+    const recipientEmailsArray = emailTo
+      .split(",")
+      .map((email) => email.trim())
+      .filter((email) => email.length > 0)
+
+    formData.append("title", title)
+    formData.append("message", message)
+    formData.append("senderEmail", user?.email || "")
+    formData.append("recipientEmails", JSON.stringify(recipientEmailsArray))
+    formData.append("password", password)
+    formData.append("passwordHash", password ? await hashPassword(password) : "")
+    formData.append("expiryDays", expiryDays.toString())
+    formData.append("downloadLimit", downloadLimit.toString())
+    formData.append("autoDeleteEnabled", autoDeleteEnabled.toString())
+    formData.append("endToEndEncryption", endToEndEncryption.toString())
+
+    const response = await fetch("/api/upload", {
+      method: "POST",
+      body: formData,
+    })
+
+    if (!response.ok) {
+      throw new Error("Failed to upload file")
+    }
+
+    const result = await response.json()
+    return result
+  }
+
+  // Add your exact multipart upload function - SIMPLIFIED VERSION
   const uploadFileMultipart = async (file: File, fileIndex: number, totalFiles: number) => {
     // Step 1: Initiate multipart upload
     const initResponse = await fetch("/api/upload/initiate", {
@@ -430,7 +470,7 @@ export function UploadForm() {
     let uploaded = 0
     const totalChunks = Math.ceil(file.size / CHUNK_SIZE)
 
-    // Step 2: Upload each chunk
+    // Step 2: Upload each chunk sequentially (like your Express version)
     for (let i = 1; i <= totalChunks; i++) {
       const start = (i - 1) * CHUNK_SIZE
       const chunk = file.slice(start, Math.min(start + CHUNK_SIZE, file.size))
@@ -448,27 +488,22 @@ export function UploadForm() {
 
       const { url } = await urlResponse.json()
 
-      // Replace the fetch call with retry logic:
-      const uploadChunkWithRetry = async (url, chunk, maxRetries = 3) => {
-        for (let attempt = 1; attempt <= maxRetries; attempt++) {
-          try {
-            const response = await fetch(url, {
-              method: "PUT",
-              body: chunk,
-              signal: AbortSignal.timeout(25000), // 25s timeout
-            })
-            if (response.ok) return response
-            throw new Error(`HTTP ${response.status}`)
-          } catch (error) {
-            console.log(`Chunk ${i} attempt ${attempt}/${maxRetries} failed:`, error)
-            if (attempt === maxRetries) throw error
-            await new Promise((resolve) => setTimeout(resolve, 1000 * attempt))
-          }
+      // Upload chunk with simple retry
+      let uploadResponse
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          uploadResponse = await fetch(url, {
+            method: "PUT",
+            body: chunk,
+          })
+          if (uploadResponse.ok) break
+          throw new Error(`HTTP ${uploadResponse.status}`)
+        } catch (error) {
+          console.log(`Chunk ${i} attempt ${attempt}/3 failed:`, error)
+          if (attempt === 3) throw error
+          await new Promise((resolve) => setTimeout(resolve, 1000 * attempt))
         }
       }
-
-      // Use it instead of direct fetch:
-      const uploadResponse = await uploadChunkWithRetry(url, chunk)
 
       if (!uploadResponse.ok) {
         throw new Error(`Failed to upload chunk ${i}`)
@@ -483,11 +518,10 @@ export function UploadForm() {
       const fileProgress = Math.round((uploaded / file.size) * 100)
       const overallProgress = Math.round(((fileIndex + uploaded / file.size) / totalFiles) * 100)
       setUploadProgress(overallProgress)
-
       setUploadStatus(`${file.name}: ${fileProgress}% (chunk ${i}/${totalChunks})`)
     }
 
-    // Step 3: Complete the multipart upload
+    // Step 3: Complete the multipart upload WITH TRANSFER DATA
     const transferData = {
       title,
       message,
@@ -513,7 +547,8 @@ export function UploadForm() {
     })
 
     if (!completeResponse.ok) {
-      throw new Error("Failed to complete upload")
+      const errorText = await completeResponse.text()
+      throw new Error(`Failed to complete upload: ${errorText}`)
     }
 
     const result = await completeResponse.json()
